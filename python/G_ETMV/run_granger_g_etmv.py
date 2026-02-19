@@ -7,10 +7,12 @@ temporal modulations and trial-by-trial variability in spike trains.
 by Casile A., Faghih R. T. & Brown E. N.
 
 Converted from MATLAB to Python.
+Parallel execution uses joblib (equivalent to MATLAB's parfor).
 """
 
 import numpy as np
 from scipy.stats import chi2
+from joblib import Parallel, delayed
 
 from .fit_glm_g_etmv import fit_glm_g_etmv
 from .compute_log_likelihood_spike_trains_trial_by_trial_var import (
@@ -23,7 +25,67 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from G_ETM.fdr import fdr
 
 
-def run_granger_g_etmv(spike_trains, global_regressor_in, history_regressor, history_regressor_n_bins):
+# ---------------------------------------------------------------------------
+# Module-level worker functions (must be defined at module scope so that
+# joblib's loky/multiprocessing backend can pickle them)
+# ---------------------------------------------------------------------------
+
+def _fit_one_etmv_round1(spike_trains, global_regressor, history_regressor,
+                          neuron_ind, n_regressor_steps, hist_ind, global_ind):
+    """Fit GLM for one (neuron, history-bins, global-bins) combination – Round 1 (G-ETMV).
+
+    Returns a tuple of all results needed to populate the output arrays.
+    """
+    print(
+        f"Processing neuron #{neuron_ind + 1} -- "
+        f"history regressor steps = {n_regressor_steps} -- "
+        f"global regressor steps = {global_regressor['nBins']}"
+    )
+    (tmp_trials, tmp_global, tmp_history, dev,
+     tmp_trials_p_vals, tmp_global_p_vals, tmp_history_p_vals) = fit_glm_g_etmv(
+        spike_trains, global_regressor, history_regressor,
+        neuron_ind, n_regressor_steps
+    )
+    ll = compute_log_likelihood_spike_trains_trial_by_trial_var(
+        spike_trains, tmp_trials, tmp_global, tmp_history,
+        global_regressor, history_regressor, neuron_ind
+    )
+    aic_val = -2.0 * ll + 2.0 * (tmp_history.size + tmp_global.size + tmp_trials.size + 1)
+    return (neuron_ind, hist_ind, global_ind,
+            tmp_trials, tmp_global, tmp_history, dev,
+            tmp_trials_p_vals, tmp_global_p_vals, tmp_history_p_vals,
+            ll, aic_val)
+
+
+def _fit_one_etmv_causal(spike_trains, global_regressor, history_regressor,
+                           target_ind, n_history_bins, trigger_ind, baseline_dev):
+    """Fit GLM for one (target, trigger) pair – causal step (G-ETMV).
+
+    Returns a tuple of all results needed to populate the causal output arrays.
+    """
+    print(
+        f"Causal Step - Processing target neuron #{target_ind + 1} "
+        f"-- trigger neuron #{trigger_ind + 1}"
+    )
+    print(
+        f"Target Neuron: nHistoryBins {n_history_bins} -- "
+        f"nGlobalBins {global_regressor['nBins']}"
+    )
+    (tmp_trials, tmp_global, tmp_history, dev,
+     tmp_trials_p_vals, tmp_global_p_vals, tmp_history_p_vals) = fit_glm_g_etmv(
+        spike_trains, global_regressor, history_regressor,
+        target_ind, n_history_bins, trigger_ind
+    )
+    dev_ratio = dev - baseline_dev
+    return (target_ind, trigger_ind, tmp_trials, tmp_global, tmp_history, dev_ratio)
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
+def run_granger_g_etmv(spike_trains, global_regressor_in, history_regressor,
+                        history_regressor_n_bins, n_jobs=-1):
     """Run the G-ETMV Granger causality analysis (with trial-by-trial variability).
 
     Parameters
@@ -36,6 +98,10 @@ def run_granger_g_etmv(spike_trains, global_regressor_in, history_regressor, his
         Dictionary with keys 'binDuration_samples', 'winHistory_samples', etc.
     history_regressor_n_bins : array-like
         Array of history regressor bin counts to test.
+    n_jobs : int, optional
+        Number of parallel jobs (passed to joblib).
+        ``-1`` uses all available CPUs, ``1`` runs serially.
+        Default is ``-1``.
 
     Returns
     -------
@@ -49,22 +115,22 @@ def run_granger_g_etmv(spike_trains, global_regressor_in, history_regressor, his
     n_global_regressor_n_bins = len(global_regressor_in['nBins'])
 
     # Storage for fitted parameters
-    beta_trials = [[[ None for _ in range(n_global_regressor_n_bins)]
+    beta_trials = [[[None for _ in range(n_global_regressor_n_bins)]
                     for _ in range(n_history_regressor_n_bins)]
                    for _ in range(n_neurons)]
-    beta_trials_p_vals = [[[ None for _ in range(n_global_regressor_n_bins)]
+    beta_trials_p_vals = [[[None for _ in range(n_global_regressor_n_bins)]
                             for _ in range(n_history_regressor_n_bins)]
                            for _ in range(n_neurons)]
-    beta_global = [[[ None for _ in range(n_global_regressor_n_bins)]
+    beta_global = [[[None for _ in range(n_global_regressor_n_bins)]
                     for _ in range(n_history_regressor_n_bins)]
                    for _ in range(n_neurons)]
-    beta_global_p_vals = [[[ None for _ in range(n_global_regressor_n_bins)]
+    beta_global_p_vals = [[[None for _ in range(n_global_regressor_n_bins)]
                             for _ in range(n_history_regressor_n_bins)]
                            for _ in range(n_neurons)]
-    beta_history = [[[ None for _ in range(n_global_regressor_n_bins)]
+    beta_history = [[[None for _ in range(n_global_regressor_n_bins)]
                      for _ in range(n_history_regressor_n_bins)]
                     for _ in range(n_neurons)]
-    beta_history_p_vals = [[[ None for _ in range(n_global_regressor_n_bins)]
+    beta_history_p_vals = [[[None for _ in range(n_global_regressor_n_bins)]
                              for _ in range(n_history_regressor_n_bins)]
                             for _ in range(n_neurons)]
 
@@ -73,7 +139,12 @@ def run_granger_g_etmv(spike_trains, global_regressor_in, history_regressor, his
     spikes_ll = np.zeros((n_neurons, n_history_regressor_n_bins, n_global_regressor_n_bins))
     aic = np.zeros((n_neurons, n_history_regressor_n_bins, n_global_regressor_n_bins))
 
-    # First round: fit full model for all combinations of regressor sizes
+    # ------------------------------------------------------------------
+    # Round 1: fit full model for all combinations of regressor sizes.
+    # The outer loop (global regressor) is serial; the inner loop over
+    # (history_regressor_ind × neuron_ind) is parallelised with joblib,
+    # matching MATLAB's  parfor currHistoryRegressorInd = 1:nhistoryRegressorNBins
+    # ------------------------------------------------------------------
     for curr_global_regressor_ind in range(n_global_regressor_n_bins):
         curr_n_global_bins = int(global_regressor_in['nBins'][curr_global_regressor_ind])
 
@@ -82,62 +153,47 @@ def run_granger_g_etmv(spike_trains, global_regressor_in, history_regressor, his
             'binDuration_samples': int(round(n_samples / curr_n_global_bins)),
         }
 
-        for curr_history_regressor_ind in range(n_history_regressor_n_bins):
-            curr_n_regressor_steps = int(history_regressor_n_bins[curr_history_regressor_ind])
+        # Build the full list of (hist_ind, neuron_ind) jobs for this global config
+        jobs = [
+            (hist_ind, neuron_ind)
+            for hist_ind in range(n_history_regressor_n_bins)
+            for neuron_ind in range(n_neurons)
+        ]
 
-            for curr_neuron_ind in range(n_neurons):
-                print(
-                    f"Processing neuron #{curr_neuron_ind + 1} -- "
-                    f"history regressor steps = {curr_n_regressor_steps} -- "
-                    f"global regressor steps = {curr_n_global_bins}"
-                )
+        results = Parallel(n_jobs=n_jobs)(
+            delayed(_fit_one_etmv_round1)(
+                spike_trains, global_regressor, history_regressor,
+                neuron_ind,
+                int(history_regressor_n_bins[hist_ind]),
+                hist_ind,
+                curr_global_regressor_ind,
+            )
+            for hist_ind, neuron_ind in jobs
+        )
 
-                (tmp_trials, tmp_global, tmp_history, dev,
-                 tmp_trials_p_vals, tmp_global_p_vals, tmp_history_p_vals) = fit_glm_g_etmv(
-                    spike_trains, global_regressor,
-                    history_regressor, curr_neuron_ind, curr_n_regressor_steps
-                )
-
-                # Save GLM fitting results
-                beta_trials[curr_neuron_ind][curr_history_regressor_ind][curr_global_regressor_ind] = tmp_trials
-                beta_trials_p_vals[curr_neuron_ind][curr_history_regressor_ind][curr_global_regressor_ind] = tmp_trials_p_vals
-                beta_global[curr_neuron_ind][curr_history_regressor_ind][curr_global_regressor_ind] = tmp_global
-                beta_history[curr_neuron_ind][curr_history_regressor_ind][curr_global_regressor_ind] = tmp_history
-                beta_global_p_vals[curr_neuron_ind][curr_history_regressor_ind][curr_global_regressor_ind] = tmp_global_p_vals
-                beta_history_p_vals[curr_neuron_ind][curr_history_regressor_ind][curr_global_regressor_ind] = tmp_history_p_vals
-
-                glm_dev[curr_neuron_ind, curr_history_regressor_ind, curr_global_regressor_ind] = dev
-
-                # Compute log-likelihood of spike trains
-                spikes_ll[curr_neuron_ind, curr_history_regressor_ind, curr_global_regressor_ind] = \
-                    compute_log_likelihood_spike_trains_trial_by_trial_var(
-                        spike_trains,
-                        beta_trials[curr_neuron_ind][curr_history_regressor_ind][curr_global_regressor_ind],
-                        beta_global[curr_neuron_ind][curr_history_regressor_ind][curr_global_regressor_ind],
-                        beta_history[curr_neuron_ind][curr_history_regressor_ind][curr_global_regressor_ind],
-                        global_regressor, history_regressor, curr_neuron_ind
-                    )
-
-                # Compute AIC
-                aic[curr_neuron_ind, curr_history_regressor_ind, curr_global_regressor_ind] = (
-                    -2 * spikes_ll[curr_neuron_ind, curr_history_regressor_ind, curr_global_regressor_ind]
-                    + 2 * (
-                        beta_history[curr_neuron_ind][curr_history_regressor_ind][curr_global_regressor_ind].size
-                        + beta_global[curr_neuron_ind][curr_history_regressor_ind][curr_global_regressor_ind].size
-                        + beta_trials[curr_neuron_ind][curr_history_regressor_ind][curr_global_regressor_ind].size
-                        + 1
-                    )
-                )
+        # Scatter results back into output arrays
+        for (n_ind, h_ind, g_ind,
+             tmp_trials, tmp_global, tmp_history, dev,
+             tmp_trials_p_vals, tmp_global_p_vals, tmp_history_p_vals,
+             ll, aic_val) in results:
+            beta_trials[n_ind][h_ind][g_ind] = tmp_trials
+            beta_trials_p_vals[n_ind][h_ind][g_ind] = tmp_trials_p_vals
+            beta_global[n_ind][h_ind][g_ind] = tmp_global
+            beta_history[n_ind][h_ind][g_ind] = tmp_history
+            beta_global_p_vals[n_ind][h_ind][g_ind] = tmp_global_p_vals
+            beta_history_p_vals[n_ind][h_ind][g_ind] = tmp_history_p_vals
+            glm_dev[n_ind, h_ind, g_ind] = dev
+            spikes_ll[n_ind, h_ind, g_ind] = ll
+            aic[n_ind, h_ind, g_ind] = aic_val
 
     # ------------------------------------------------------------------
-    # Second round: re-fit model excluding the effect of the trigger neuron
+    # Find optimal regressor sizes for each neuron using AIC
     # ------------------------------------------------------------------
     beta_trials_causal = [[None for _ in range(n_neurons)] for _ in range(n_neurons)]
     beta_global_causal = [[None for _ in range(n_neurons)] for _ in range(n_neurons)]
     beta_history_causal = [[None for _ in range(n_neurons)] for _ in range(n_neurons)]
     glm_dev_ratio = np.zeros((n_neurons, n_neurons))
 
-    # Find optimal regressor sizes for each neuron using AIC
     inds_n_bins_history_neuron = np.zeros(n_neurons, dtype=int)
     inds_n_bins_global_neuron = np.zeros(n_neurons, dtype=int)
 
@@ -153,6 +209,12 @@ def run_granger_g_etmv(spike_trains, global_regressor_in, history_regressor, his
     print(f"----- nBinsHistory_neuron = {history_regressor_n_bins[inds_n_bins_history_neuron]}")
     print(f"----- nBinsGlobal_neuron = {global_regressor_in['nBins'][inds_n_bins_global_neuron]}")
 
+    # ------------------------------------------------------------------
+    # Round 2 (causal step): re-fit excluding the trigger neuron.
+    # The outer loop (target neuron) is serial; the inner loop over
+    # trigger_neuron_ind is parallelised, matching MATLAB's
+    #   parfor triggerNeuronInd = 1:nNeurons
+    # ------------------------------------------------------------------
     print("Refitting model excluding the effect of the triggering neuron")
     for target_neuron_ind in range(n_neurons):
         n_history_bins = int(history_regressor_n_bins[inds_n_bins_history_neuron[target_neuron_ind]])
@@ -160,34 +222,25 @@ def run_granger_g_etmv(spike_trains, global_regressor_in, history_regressor, his
             'nBins': int(global_regressor_in['nBins'][inds_n_bins_global_neuron[target_neuron_ind]]),
         }
         global_regressor['binDuration_samples'] = int(round(n_samples / global_regressor['nBins']))
+        baseline_dev = float(glm_dev[
+            target_neuron_ind,
+            inds_n_bins_history_neuron[target_neuron_ind],
+            inds_n_bins_global_neuron[target_neuron_ind]
+        ])
 
-        for trigger_neuron_ind in range(n_neurons):
-            print(
-                f"Causal Step - Processing target neuron #{target_neuron_ind + 1} "
-                f"-- trigger neuron #{trigger_neuron_ind + 1}"
+        causal_results = Parallel(n_jobs=n_jobs)(
+            delayed(_fit_one_etmv_causal)(
+                spike_trains, global_regressor, history_regressor,
+                target_neuron_ind, n_history_bins, trigger_ind, baseline_dev,
             )
-            print(
-                f"Target Neuron: nHistoryBins {n_history_bins} -- "
-                f"nGlobalBins {global_regressor['nBins']}"
-            )
+            for trigger_ind in range(n_neurons)
+        )
 
-            (tmp_trials, tmp_global, tmp_history, dev,
-             tmp_trials_p_vals, tmp_global_p_vals, tmp_history_p_vals) = fit_glm_g_etmv(
-                spike_trains,
-                global_regressor, history_regressor,
-                target_neuron_ind, n_history_bins, trigger_neuron_ind
-            )
-
-            beta_trials_causal[target_neuron_ind][trigger_neuron_ind] = tmp_trials
-            beta_global_causal[target_neuron_ind][trigger_neuron_ind] = tmp_global
-            beta_history_causal[target_neuron_ind][trigger_neuron_ind] = tmp_history
-            glm_dev_ratio[target_neuron_ind, trigger_neuron_ind] = (
-                dev - glm_dev[
-                    target_neuron_ind,
-                    inds_n_bins_history_neuron[target_neuron_ind],
-                    inds_n_bins_global_neuron[target_neuron_ind]
-                ]
-            )
+        for (tgt_ind, trg_ind, tmp_trials, tmp_global, tmp_history, dev_ratio) in causal_results:
+            beta_trials_causal[tgt_ind][trg_ind] = tmp_trials
+            beta_global_causal[tgt_ind][trg_ind] = tmp_global
+            beta_history_causal[tgt_ind][trg_ind] = tmp_history
+            glm_dev_ratio[tgt_ind, trg_ind] = dev_ratio
 
     # ==== Significance Testing ====
     D = glm_dev_ratio

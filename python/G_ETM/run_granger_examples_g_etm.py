@@ -87,8 +87,10 @@ history_regressor = {
 history_regressor_n_bins = np.arange(2, history_regressor['maxNBins'] + 1, 2)
 
 # Run the Granger causality method
+# n_jobs=-1 uses all available CPUs (equivalent to MATLAB's parfor)
 out_struct = run_granger_g_etm(
-    spike_trains, global_regressor, history_regressor, history_regressor_n_bins
+    spike_trains, global_regressor, history_regressor, history_regressor_n_bins,
+    n_jobs=-1,
 )
 
 # Save all results as a .npz file

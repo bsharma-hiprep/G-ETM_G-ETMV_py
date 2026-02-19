@@ -70,14 +70,17 @@ history_regressor = {
 history_regressor_n_bins = np.arange(2, history_regressor['maxNBins'] + 1, 2)
 
 # Run the G-ETMV Granger causality method
+# n_jobs=-1 uses all available CPUs (equivalent to MATLAB's parfor)
 # (comment the line below and uncomment the G-ETM import to run G-ETM instead)
 out_struct = run_granger_g_etmv(
-    spike_trains, global_regressor, history_regressor, history_regressor_n_bins
+    spike_trains, global_regressor, history_regressor, history_regressor_n_bins,
+    n_jobs=-1,
 )
 # To run G-ETM instead:
 # from G_ETM.run_granger_g_etm import run_granger_g_etm
 # out_struct = run_granger_g_etm(
-#     spike_trains, global_regressor, history_regressor, history_regressor_n_bins
+#     spike_trains, global_regressor, history_regressor, history_regressor_n_bins,
+#     n_jobs=-1,
 # )
 
 # Save all results
